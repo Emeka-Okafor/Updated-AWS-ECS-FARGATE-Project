@@ -5,6 +5,13 @@ terraform {
       version = "~> 6.0"
     }
   }
+
+  backend "s3" {
+   bucket         = "terraform-state-prod"
+   key            = "ecs/terraform.tfstate"
+   region         = "us-east-1"
+   dynamodb_table = "terraform-lock"
+ }
 }
 
 provider "aws" {
@@ -222,6 +229,23 @@ data "aws_acm_certificate" "app_cert" {
   most_recent = true
 }
 
+resource "aws_lb_listener" "http_redirect" {
+  load_balancer_arn = aws_lb.app_alb.arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    type = "redirect"
+
+    redirect {
+      port        = "443"
+      protocol    = "HTTPS"
+      status_code = "HTTP_301"
+    }
+  }
+}
+
+
 resource "aws_lb_listener" "https" {
   load_balancer_arn = aws_lb.app_alb.arn
   port              = 443
@@ -260,6 +284,11 @@ resource "aws_iam_role_policy_attachment" "ecs_task_execution_role_policy" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
+resource "aws_cloudwatch_log_group" "ecs_logs" {
+  name              = "/ecs/app"
+  retention_in_days = 7
+}
+
 resource "aws_ecs_task_definition" "app_task" {
   family                   = "prod-app-task"
   requires_compatibilities = ["FARGATE"]
@@ -267,20 +296,57 @@ resource "aws_ecs_task_definition" "app_task" {
   cpu                      = "256"
   memory                   = "512"
   execution_role_arn       = aws_iam_role.ecs_task_execution_role.arn
+  task_role_arn = aws_iam_role.ecs_task_role.arn
 
   container_definitions = jsonencode([
     {
       name  = "app"
-      image = "nginx:latest"
+      image = "${aws_ecr_repository.app_repo.repository_url}:latest"
       portMappings = [
         {
           containerPort = 80
           protocol      = "tcp"
         }
       ]
+
+      logConfiguration = {
+      logDriver = "awslogs"
+      options = {
+        awslogs-group         = "/ecs/app"
+        awslogs-region        = "us-east-1"
+        awslogs-stream-prefix = "ecs"
+      }
     }
-  ])
+  }
+])
 }
+
+resource "aws_ecr_repository" "app_repo" {
+  name = "prod-app"
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+}
+
+resource "aws_iam_role" "ecs_task_role" {
+  name = "ecsTaskRole"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Service = "ecs-tasks.amazonaws.com"
+        }
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
+}
+  
+
 
 resource "aws_ecs_service" "app_service" {
   name            = "prod-app-service"
@@ -288,6 +354,8 @@ resource "aws_ecs_service" "app_service" {
   task_definition = aws_ecs_task_definition.app_task.arn
   desired_count   = 2
   launch_type     = "FARGATE"
+
+  health_check_grace_period_seconds = 60
 
   network_configuration {
     subnets = [
@@ -312,6 +380,35 @@ resource "aws_ecs_service" "app_service" {
     aws_lb_listener.https
   ]
 }
+
+resource "aws_appautoscaling_target" "ecs_target" {
+  max_capacity       = 5
+  min_capacity       = 2
+  resource_id        = "service/${aws_ecs_cluster.app_cluster.name}/${aws_ecs_service.app_service.name}"
+  scalable_dimension = "ecs:service:DesiredCount"
+  service_namespace  = "ecs"
+}
+
+resource "aws_appautoscaling_policy" "ecs_cpu_policy" {
+  name               = "ecs-cpu-scaling"
+  policy_type        = "TargetTrackingScaling"
+  resource_id        = aws_appautoscaling_target.ecs_target.resource_id
+  scalable_dimension = aws_appautoscaling_target.ecs_target.scalable_dimension
+  service_namespace  = aws_appautoscaling_target.ecs_target.service_namespace
+
+  target_tracking_scaling_policy_configuration {
+    target_value = 60
+
+    predefined_metric_specification {
+      predefined_metric_type = "ECSServiceAverageCPUUtilization"
+    }
+
+    scale_in_cooldown  = 60
+    scale_out_cooldown = 60
+  }
+}
+
+
 
 # COST NOTE:
 # If you are worried about cost, temporally set desired_count = 1
